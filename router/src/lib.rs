@@ -3,7 +3,7 @@ mod logging;
 mod prometheus;
 
 #[cfg(feature = "http")]
-mod http;
+pub mod http;
 
 #[cfg(feature = "http")]
 use ::http::HeaderMap;
@@ -144,7 +144,7 @@ pub async fn run(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn bootstrap(
+pub async fn bootstrap(
     model_id: &str,
     revision: Option<String>,
     tokenization_workers: Option<usize>,

@@ -1665,7 +1665,7 @@ pub async fn run(
 ///   .merge(SwaggerUi::new("/api-docs").url("/api-docs/openapi.json", api_docs));
 /// ```
 #[allow(clippy::too_many_arguments)]
-fn init_router(
+pub fn init_router(
     infer: Infer,
     info: Info,
     prom_builder: Option<PrometheusBuilder>,
