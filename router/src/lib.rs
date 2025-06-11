@@ -17,16 +17,16 @@ use tonic::codegen::http::HeaderMap;
 mod shutdown;
 
 use anyhow::{anyhow, Context, Result};
-use hf_hub::api::tokio::ApiBuilder;
+use hf_hub::api::tokio::{ApiBuilder, ApiRepo};
 use hf_hub::{Repo, RepoType};
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use text_embeddings_backend::{DType, Pool};
+use text_embeddings_backend::{Backend, DType, Pool};
 use text_embeddings_core::download::{download_artifacts, ST_CONFIG_NAMES};
 use text_embeddings_core::infer::Infer;
 use text_embeddings_core::queue::Queue;
@@ -66,231 +66,27 @@ pub async fn run(
     prometheus_port: u16,
     cors_allow_origin: Option<Vec<String>>,
 ) -> Result<()> {
-    let model_id_path = Path::new(&model_id);
-    let (model_root, api_repo) = if model_id_path.exists() && model_id_path.is_dir() {
-        // Using a local model
-        (model_id_path.to_path_buf(), None)
-    } else {
-        let mut builder = ApiBuilder::from_env()
-            .with_progress(false)
-            .with_token(hf_token);
-
-        if let Some(cache_dir) = huggingface_hub_cache {
-            builder = builder.with_cache_dir(cache_dir.into());
-        }
-
-        if let Ok(origin) = std::env::var("HF_HUB_USER_AGENT_ORIGIN") {
-            builder = builder.with_user_agent("origin", origin.as_str());
-        }
-
-        let api = builder.build().unwrap();
-        let api_repo = api.repo(Repo::with_revision(
-            model_id.clone(),
-            RepoType::Model,
-            revision.clone().unwrap_or("main".to_string()),
-        ));
-
-        // Download model from the Hub
-        (
-            download_artifacts(&api_repo, pooling.is_none())
-                .await
-                .context("Could not download model artifacts")?,
-            Some(api_repo),
-        )
-    };
-
-    // Load config
-    let config_path = model_root.join("config.json");
-    let config = fs::read_to_string(config_path).context("`config.json` not found")?;
-    let config: ModelConfig =
-        serde_json::from_str(&config).context("Failed to parse `config.json`")?;
-
-    // Set model type from config
-    let backend_model_type = get_backend_model_type(&config, &model_root, pooling)?;
-
-    // Info model type
-    let model_type = match &backend_model_type {
-        text_embeddings_backend::ModelType::Classifier => {
-            let id2label = config
-                .id2label
-                .context("`config.json` does not contain `id2label`")?;
-            let n_classes = id2label.len();
-            let classifier_model = ClassifierModel {
-                id2label,
-                label2id: config
-                    .label2id
-                    .context("`config.json` does not contain `label2id`")?,
-            };
-            if n_classes > 1 {
-                ModelType::Classifier(classifier_model)
-            } else {
-                ModelType::Reranker(classifier_model)
-            }
-        }
-        text_embeddings_backend::ModelType::Embedding(pool) => {
-            ModelType::Embedding(EmbeddingModel {
-                pooling: pool.to_string(),
-            })
-        }
-    };
-
-    // Load tokenizer
-    let tokenizer_path = model_root.join("tokenizer.json");
-    let mut tokenizer = Tokenizer::from_file(tokenizer_path).expect(
-        "tokenizer.json not found. text-embeddings-inference only supports fast tokenizers",
-    );
-    tokenizer.with_padding(None);
-    // Qwen2 updates the post processor manually instead of into the tokenizer.json...
-    // https://huggingface.co/Alibaba-NLP/gte-Qwen2-1.5B-instruct/blob/main/tokenization_qwen.py#L246
-    if config.model_type == "qwen2" {
-        let template = TemplateProcessing::builder()
-            .try_single("$A:0 <|endoftext|>:0")
-            .unwrap()
-            .try_pair("$A:0 <|endoftext|>:0 $B:1 <|endoftext|>:1")
-            .unwrap()
-            .special_tokens(vec![("<|endoftext|>", 151643)])
-            .build()
-            .unwrap();
-        match tokenizer.get_post_processor() {
-            None => tokenizer.with_post_processor(Some(template)),
-            Some(post_processor) => {
-                let post_processor = Sequence::new(vec![
-                    post_processor.clone(),
-                    PostProcessorWrapper::Template(template),
-                ]);
-                tokenizer.with_post_processor(Some(post_processor))
-            }
-        };
-    }
-
-    // Position IDs offset. Used for Roberta and camembert.
-    let position_offset = if &config.model_type == "xlm-roberta"
-        || &config.model_type == "camembert"
-        || &config.model_type == "roberta"
-    {
-        config.pad_token_id + 1
-    } else {
-        0
-    };
-
-    // Try to load ST Config
-    let mut st_config: Option<STConfig> = None;
-    for name in ST_CONFIG_NAMES {
-        let config_path = model_root.join(name);
-        if let Ok(config) = fs::read_to_string(config_path) {
-            st_config =
-                Some(serde_json::from_str(&config).context(format!("Failed to parse `{}`", name))?);
-            break;
-        }
-    }
-    let max_input_length = match st_config {
-        Some(config) => config.max_seq_length,
-        None => {
-            tracing::warn!("Could not find a Sentence Transformers config");
-            config.max_position_embeddings - position_offset
-        }
-    };
-    tracing::info!("Maximum number of tokens per request: {max_input_length}");
-
-    let tokenization_workers = tokenization_workers.unwrap_or_else(num_cpus::get);
-
-    // Try to load new ST Config
-    let mut new_st_config: Option<NewSTConfig> = None;
-    let config_path = model_root.join("config_sentence_transformers.json");
-    if let Ok(config) = fs::read_to_string(config_path) {
-        new_st_config = Some(
-            serde_json::from_str(&config)
-                .context("Failed to parse `config_sentence_transformers.json`")?,
-        );
-    }
-    let prompts = new_st_config.and_then(|c| c.prompts);
-    let default_prompt = if let Some(default_prompt_name) = default_prompt_name.as_ref() {
-        match &prompts {
-            None => {
-                anyhow::bail!(format!("`default-prompt-name` is set to `{default_prompt_name}` but no prompts were found in the Sentence Transformers configuration"));
-            }
-            Some(prompts) if !prompts.contains_key(default_prompt_name) => {
-                anyhow::bail!(format!("`default-prompt-name` is set to `{default_prompt_name}` but it was not found in the Sentence Transformers prompts. Available prompts: {:?}", prompts.keys()));
-            }
-            Some(prompts) => prompts.get(default_prompt_name).cloned(),
-        }
-    } else {
-        default_prompt
-    };
-
-    // Tokenization logic
-    let tokenization = Tokenization::new(
+    let (infer, info) = bootstrap(
+        &model_id,
+        revision,
         tokenization_workers,
-        tokenizer,
-        max_input_length,
-        position_offset,
-        default_prompt,
-        prompts,
-    );
-
-    // Get dtype
-    let dtype = dtype.unwrap_or_default();
-
-    // Create backend
-    tracing::info!("Starting model backend");
-    let backend = text_embeddings_backend::Backend::new(
-        model_root,
-        api_repo,
-        dtype.clone(),
-        backend_model_type,
-        uds_path.unwrap_or("/tmp/text-embeddings-inference-server".to_string()),
-        otlp_endpoint.clone(),
-        otlp_service_name.clone(),
-    )
-    .await
-    .context("Could not create backend")?;
-    backend
-        .health()
-        .await
-        .context("Model backend is not healthy")?;
-
-    tracing::info!("Warming up model");
-    backend
-        .warmup(max_input_length, max_batch_tokens, max_batch_requests)
-        .await
-        .context("Model backend is not healthy")?;
-
-    let max_batch_requests = backend
-        .max_batch_size
-        .inspect(|&s| {
-            tracing::warn!("Backend does not support a batch size > {s}");
-            tracing::warn!("forcing `max_batch_requests={s}`");
-        })
-        .or(max_batch_requests);
-
-    // Queue logic
-    let queue = Queue::new(
-        backend.padded_model,
-        max_batch_tokens,
-        max_batch_requests,
+        dtype,
+        pooling,
         max_concurrent_requests,
-    );
-
-    // Create infer task
-    let infer = Infer::new(tokenization, queue, max_concurrent_requests, backend);
-
-    // Endpoint info
-    let info = Info {
-        model_id,
-        model_sha: revision,
-        model_dtype: dtype.to_string(),
-        model_type,
-        max_concurrent_requests,
-        max_input_length,
         max_batch_tokens,
-        tokenization_workers,
         max_batch_requests,
         max_client_batch_size,
         auto_truncate,
-        version: env!("CARGO_PKG_VERSION"),
-        sha: option_env!("VERGEN_GIT_SHA"),
-        docker_label: option_env!("DOCKER_LABEL"),
-    };
+        default_prompt,
+        default_prompt_name,
+        hf_token,
+        uds_path,
+        huggingface_hub_cache,
+        otlp_endpoint,
+        &otlp_service_name,
+    )
+    .await
+    .context("Failed to bootstrap.")?;
 
     // use AIP_HTTP_PORT if google feature is enabled
     let port = if cfg!(feature = "google") {
@@ -345,6 +141,191 @@ pub async fn run(
         let _ = payload_limit;
         grpc::server::run(infer, info, addr, prom_builder, api_key).await
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn bootstrap(
+    model_id: &str,
+    revision: Option<String>,
+    tokenization_workers: Option<usize>,
+    dtype: Option<DType>,
+    pooling: Option<text_embeddings_backend::Pool>,
+    max_concurrent_requests: usize,
+    max_batch_tokens: usize,
+    max_batch_requests: Option<usize>,
+    max_client_batch_size: usize,
+    auto_truncate: bool,
+    default_prompt: Option<String>,
+    default_prompt_name: Option<String>,
+    hf_token: Option<String>,
+    uds_path: Option<String>,
+    huggingface_hub_cache: Option<String>,
+    otlp_endpoint: Option<String>,
+    otlp_service_name: &str,
+) -> Result<(Infer, Info)> {
+    let (model_root, api_repo) = get_model_root_and_api_repo(
+        model_id,
+        &revision,
+        &pooling,
+        &huggingface_hub_cache,
+        hf_token,
+    )
+    .await
+    .context("Failed to get model_root and api_repo.")?;
+
+    // Load config
+    let config = load_config(&model_root).context("Failed to load config.")?;
+
+    // Set model type from config
+    let backend_model_type = get_backend_model_type(&config, &model_root, pooling)?;
+
+    // Info model type
+    let model_type = get_model_type_from_backend_model_type(config.clone(), &backend_model_type)?;
+
+    // Load tokenizer
+    let tokenizer =
+        load_tokenizer(&model_root, &config.model_type).context("Couldn't load tokenizer.")?;
+
+    // Position IDs offset. Used for Roberta and camembert.
+    let position_offset = get_position_offset(&config.model_type, config.pad_token_id);
+
+    // Try to load ST Config
+    let st_config = load_sentence_transformers_config(&model_root)
+        .context("Couldn't load Sentence Transformers config.")?;
+
+    let max_input_length =
+        get_max_input_length(&st_config, config.max_position_embeddings, position_offset);
+
+    let tokenization_workers = tokenization_workers.unwrap_or_else(num_cpus::get);
+
+    // Try to load new ST Config
+    let new_st_config = load_new_sentence_transformers_config(&model_root)
+        .context("Couldn't load New Sentence Transformers config.")?;
+
+    let prompts = new_st_config.and_then(|c| c.prompts);
+
+    let default_prompt = configure_default_prompt(default_prompt, &default_prompt_name, &prompts)
+        .context("Couldn't configure default prompt.")?;
+
+    // Tokenization logic
+    let tokenization = Tokenization::new(
+        tokenization_workers,
+        tokenizer,
+        max_input_length,
+        position_offset,
+        default_prompt,
+        prompts,
+    );
+
+    // Get dtype
+    let dtype = dtype.unwrap_or_default();
+
+    // Create backend
+    let backend = init_backend(
+        model_root,
+        api_repo,
+        dtype.clone(),
+        backend_model_type,
+        uds_path,
+        otlp_endpoint,
+        otlp_service_name,
+        max_input_length,
+        max_batch_tokens,
+        max_batch_requests,
+    )
+    .await
+    .context("Couldn't init backend.")?;
+
+    let max_batch_requests = backend
+        .max_batch_size
+        .inspect(|&s| {
+            tracing::warn!("Backend does not support a batch size > {s}");
+            tracing::warn!("forcing `max_batch_requests={s}`");
+        })
+        .or(max_batch_requests);
+
+    // Queue logic
+    let queue = Queue::new(
+        backend.padded_model,
+        max_batch_tokens,
+        max_batch_requests,
+        max_concurrent_requests,
+    );
+
+    // Create infer task
+    let infer = Infer::new(tokenization, queue, max_concurrent_requests, backend);
+
+    // Endpoint info
+    let info = Info {
+        model_id: model_id.to_string(),
+        model_sha: revision,
+        model_dtype: dtype.to_string(),
+        model_type,
+        max_concurrent_requests,
+        max_input_length,
+        max_batch_tokens,
+        tokenization_workers,
+        max_batch_requests,
+        max_client_batch_size,
+        auto_truncate,
+        version: env!("CARGO_PKG_VERSION"),
+        sha: option_env!("VERGEN_GIT_SHA"),
+        docker_label: option_env!("DOCKER_LABEL"),
+    };
+
+    Ok((infer, info))
+}
+
+async fn get_model_root_and_api_repo(
+    model_id: &str,
+    revision: &Option<String>,
+    pooling: &Option<text_embeddings_backend::Pool>,
+    huggingface_hub_cache: &Option<String>,
+    hf_token: Option<String>,
+) -> Result<(PathBuf, Option<ApiRepo>)> {
+    let model_id_path = Path::new(model_id);
+    let (model_root, api_repo) = if model_id_path.exists() && model_id_path.is_dir() {
+        // Using a local model
+        (model_id_path.to_path_buf(), None)
+    } else {
+        let mut builder = ApiBuilder::from_env()
+            .with_progress(false)
+            .with_token(hf_token);
+
+        if let Some(cache_dir) = huggingface_hub_cache {
+            builder = builder.with_cache_dir(cache_dir.into());
+        }
+
+        if let Ok(origin) = std::env::var("HF_HUB_USER_AGENT_ORIGIN") {
+            builder = builder.with_user_agent("origin", origin.as_str());
+        }
+
+        let api = builder.build().unwrap();
+        let api_repo = api.repo(Repo::with_revision(
+            model_id.to_string(),
+            RepoType::Model,
+            revision.clone().unwrap_or("main".to_string()),
+        ));
+
+        // Download model from the Hub
+        (
+            download_artifacts(&api_repo, pooling.is_none())
+                .await
+                .context("Could not download model artifacts")?,
+            Some(api_repo),
+        )
+    };
+
+    Ok((model_root, api_repo))
+}
+
+fn load_config(model_root: &Path) -> Result<ModelConfig> {
+    let config_path = model_root.join("config.json");
+    let config = fs::read_to_string(&config_path).context("`config.json` not found")?;
+    let config: ModelConfig =
+        serde_json::from_str(&config).context("Failed to parse `config.json`")?;
+
+    Ok(config)
 }
 
 fn get_backend_model_type(
@@ -408,7 +389,189 @@ fn get_backend_model_type(
     Ok(text_embeddings_backend::ModelType::Embedding(pool))
 }
 
-#[derive(Debug, Deserialize)]
+fn get_model_type_from_backend_model_type(
+    config: ModelConfig,
+    backend_model_type: &text_embeddings_backend::ModelType,
+) -> Result<ModelType> {
+    let model_type = match backend_model_type {
+        text_embeddings_backend::ModelType::Classifier => {
+            let id2label = config
+                .id2label
+                .context("`config.json` does not contain `id2label`")?;
+            let n_classes = id2label.len();
+            let classifier_model = ClassifierModel {
+                id2label,
+                label2id: config
+                    .label2id
+                    .context("`config.json` does not contain `label2id`")?,
+            };
+            if n_classes > 1 {
+                ModelType::Classifier(classifier_model)
+            } else {
+                ModelType::Reranker(classifier_model)
+            }
+        }
+        text_embeddings_backend::ModelType::Embedding(pool) => {
+            ModelType::Embedding(EmbeddingModel {
+                pooling: pool.to_string(),
+            })
+        }
+    };
+
+    Ok(model_type)
+}
+
+fn load_tokenizer(model_root: &Path, model_type: &str) -> Result<Tokenizer> {
+    let tokenizer_path = model_root.join("tokenizer.json");
+    let mut tokenizer = Tokenizer::from_file(tokenizer_path).expect(
+        "tokenizer.json not found. text-embeddings-inference only supports fast tokenizers",
+    );
+
+    tokenizer.with_padding(None);
+
+    // Qwen2 updates the post processor manually instead of into the tokenizer.json...
+    // https://huggingface.co/Alibaba-NLP/gte-Qwen2-1.5B-instruct/blob/main/tokenization_qwen.py#L246
+    if model_type == "qwen2" {
+        let template = TemplateProcessing::builder()
+            .try_single("$A:0 <|endoftext|>:0")
+            .unwrap()
+            .try_pair("$A:0 <|endoftext|>:0 $B:1 <|endoftext|>:1")
+            .unwrap()
+            .special_tokens(vec![("<|endoftext|>", 151643)])
+            .build()
+            .unwrap();
+        match tokenizer.get_post_processor() {
+            None => tokenizer.with_post_processor(Some(template)),
+            Some(post_processor) => {
+                let post_processor = Sequence::new(vec![
+                    post_processor.clone(),
+                    PostProcessorWrapper::Template(template),
+                ]);
+                tokenizer.with_post_processor(Some(post_processor))
+            }
+        };
+    }
+
+    Ok(tokenizer)
+}
+
+/// Position IDs offset. Used for Roberta and camembert.
+fn get_position_offset(model_type: &str, pad_token_id: usize) -> usize {
+    match model_type {
+        "xlm-roberta" | "camembert" | "roberta" => pad_token_id + 1,
+        _ => 0,
+    }
+}
+
+fn load_sentence_transformers_config(model_root: &Path) -> Result<Option<STConfig>> {
+    let mut st_config: Option<STConfig> = None;
+    for name in ST_CONFIG_NAMES {
+        let config_path = model_root.join(name);
+        if let Ok(config) = fs::read_to_string(config_path) {
+            st_config =
+                Some(serde_json::from_str(&config).context(format!("Failed to parse `{}`", name))?);
+            break;
+        }
+    }
+
+    Ok(st_config)
+}
+
+// TODO: dedupe with load_sentence_transformers_config
+fn load_new_sentence_transformers_config(model_root: &Path) -> Result<Option<NewSTConfig>> {
+    let mut new_st_config: Option<NewSTConfig> = None;
+    let config_name = "config_sentence_transformers.json";
+    let config_path = model_root.join(config_name);
+    if let Ok(config) = fs::read_to_string(config_path) {
+        new_st_config = Some(
+            serde_json::from_str(&config).context(format!("Failed to parse `{config_name}`"))?,
+        );
+    }
+
+    Ok(new_st_config)
+}
+
+fn get_max_input_length(
+    st_config: &Option<STConfig>,
+    max_position_embeddings: usize,
+    position_offset: usize,
+) -> usize {
+    let max_input_length = match st_config {
+        Some(config) => config.max_seq_length,
+        None => {
+            tracing::warn!("Could not find a Sentence Transformers config");
+            max_position_embeddings - position_offset
+        }
+    };
+    tracing::info!("Maximum number of tokens per request: {max_input_length}");
+
+    max_input_length
+}
+
+fn configure_default_prompt(
+    default_prompt: Option<String>,
+    default_prompt_name: &Option<String>,
+    prompts: &Option<HashMap<String, String>>,
+) -> Result<Option<String>> {
+    let configured_default_prompt = if let Some(default_prompt_name) = default_prompt_name.as_ref()
+    {
+        match &prompts {
+            None => {
+                anyhow::bail!(format!("`default-prompt-name` is set to `{default_prompt_name}` but no prompts were found in the Sentence Transformers configuration"));
+            }
+            Some(prompts) if !prompts.contains_key(default_prompt_name) => {
+                anyhow::bail!(format!("`default-prompt-name` is set to `{default_prompt_name}` but it was not found in the Sentence Transformers prompts. Available prompts: {:?}", prompts.keys()));
+            }
+            Some(prompts) => prompts.get(default_prompt_name).cloned(),
+        }
+    } else {
+        default_prompt
+    };
+
+    Ok(configured_default_prompt)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn init_backend(
+    model_root: PathBuf,
+    api_repo: Option<ApiRepo>,
+    dtype: DType,
+    backend_model_type: text_embeddings_backend::ModelType,
+    uds_path: Option<String>,
+    otlp_endpoint: Option<String>,
+    otlp_service_name: &str,
+    max_input_length: usize,
+    max_batch_tokens: usize,
+    max_batch_requests: Option<usize>,
+) -> Result<Backend> {
+    tracing::info!("Starting model backend");
+    let backend = text_embeddings_backend::Backend::new(
+        model_root,
+        api_repo,
+        dtype,
+        backend_model_type,
+        uds_path.unwrap_or("/tmp/text-embeddings-inference-server".to_string()),
+        otlp_endpoint,
+        otlp_service_name.to_string(),
+    )
+    .await
+    .context("Could not create backend")?;
+
+    backend
+        .health()
+        .await
+        .context("Model backend is not healthy")?;
+
+    tracing::info!("Warming up model");
+    backend
+        .warmup(max_input_length, max_batch_tokens, max_batch_requests)
+        .await
+        .context("Model backend is not healthy")?;
+
+    Ok(backend)
+}
+
+#[derive(Clone, Debug, Deserialize)]
 pub struct ModelConfig {
     pub architectures: Vec<String>,
     pub model_type: String,

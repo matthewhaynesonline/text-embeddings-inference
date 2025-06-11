@@ -1600,80 +1600,82 @@ pub async fn run(
     api_key: Option<String>,
     cors_allow_origin: Option<Vec<String>>,
 ) -> Result<(), anyhow::Error> {
-    // OpenAPI documentation
-    #[derive(OpenApi)]
-    #[openapi(
-    paths(
-    get_model_info,
-    health,
-    predict,
-    rerank,
-    embed,
-    embed_all,
-    embed_sparse,
-    openai_embed,
-    similarity,
-    tokenize,
-    decode,
-    metrics,
-    ),
-    components(
-    schemas(
-    PredictInput,
-    Input,
-    Info,
-    ModelType,
-    ClassifierModel,
-    Embedding,
-    EncodingFormat,
-    EmbeddingModel,
-    PredictRequest,
-    Prediction,
-    PredictResponse,
-    OpenAICompatRequest,
-    OpenAICompatEmbedding,
-    OpenAICompatUsage,
-    OpenAICompatResponse,
-    EmbedAllRequest,
-    EmbedAllResponse,
-    EmbedSparseRequest,
-    SparseValue,
-    EmbedSparseResponse,
-    RerankRequest,
-    Rank,
-    RerankResponse,
-    EmbedRequest,
-    EmbedResponse,
-    ErrorResponse,
-    OpenAICompatErrorResponse,
-    TokenizeInput,
-    TokenizeRequest,
-    TokenizeResponse,
-    TruncationDirection,
-    SimilarityInput,
-    SimilarityParameters,
-    SimilarityRequest,
-    SimilarityResponse,
-    SimpleToken,
-    InputType,
-    InputIds,
-    DecodeRequest,
-    DecodeResponse,
-    ErrorType,
+    let app = init_router(
+        infer,
+        info,
+        Some(prom_builder),
+        payload_limit,
+        api_key,
+        cors_allow_origin,
+        true,
+        None,
     )
-    ),
-    tags(
-    (name = "Text Embeddings Inference", description = "Hugging Face Text Embeddings Inference API")
-    ),
-    info(
-    title = "Text Embeddings Inference",
-    license(
-    name = "Apache 2.0",
-    url = "https://www.apache.org/licenses/LICENSE-2.0"
-    )
-    )
-    )]
-    struct ApiDoc;
+    .context("Could not init router")?;
+
+    // Run server
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .context(format!("Could not bind TCP Listener on {addr}"))?;
+
+    tracing::info!("Starting HTTP server: {}", &addr);
+    tracing::info!("Ready");
+
+    axum::serve(listener, app)
+        // Wait until all requests are finished to shut down
+        .with_graceful_shutdown(shutdown::shutdown_signal())
+        .await?;
+
+    Ok(())
+}
+
+/// Initializes and configures the underlying axum router with TER API endpoints.
+///
+/// This function creates a router with all the necessary API endpoints,
+/// CORS configuration, body size limits, and optional Swagger documentation.
+///
+/// ### Example
+/// ```no_run
+/// // MyApp
+/// use axum::{Router, routing::{get, post}};
+/// use utoipa::OpenApi;
+/// use utoipa_swagger_ui::SwaggerUi;
+/// use text-embeddings-router::router::http::init_router;
+///
+/// #[derive(OpenApi)]
+/// #[openapi(
+///     paths(root, controllers::custom_chat),
+///     tags(
+///         (name = "hello", description = "Hello world endpoints")
+///     ),
+///     info(
+///         title = "Hello World API",
+///         version = "1.0.0",
+///         description = "A simple API that responds with a greeting"
+///     )
+/// )]
+/// struct ApiDoc;
+///
+/// let ter_base_path = "/api/ter";
+/// let ter_doc = get_openapi_doc(Some(ter_base_path));
+/// let mut api_docs = ApiDoc::openapi();
+/// api_docs.merge(ter_doc);
+///
+/// let app = Router::new()
+///   .route("/", get(root))
+///   .merge(SwaggerUi::new("/api-docs").url("/api-docs/openapi.json", api_docs));
+/// ```
+#[allow(clippy::too_many_arguments)]
+fn init_router(
+    infer: Infer,
+    info: Info,
+    prom_builder: Option<PrometheusBuilder>,
+    payload_limit: usize,
+    api_key: Option<String>,
+    cors_allow_origin: Option<Vec<String>>,
+    include_swagger_routes: bool,
+    base_path: Option<&str>,
+) -> Result<Router, anyhow::Error> {
+    let prefix = base_path.unwrap_or("");
 
     // CORS allowed origins
     // map to go inside the option and then map to parse from String to HeaderValue
@@ -1690,40 +1692,12 @@ pub async fn run(
         }
     });
 
-    // See: https://github.com/metrics-rs/metrics/issues/467#issuecomment-2022755151
-    let (recorder, _) = prom_builder
-        .build()
-        .context("failed to build prometheus recorder")?;
-    let prom_handle = recorder.handle();
-    metrics::set_global_recorder(recorder).context("Failed to set global recorder")?;
-
     // CORS layer
     let allow_origin = allow_origin.unwrap_or(AllowOrigin::any());
     let cors_layer = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST])
         .allow_headers([http::header::CONTENT_TYPE])
         .allow_origin(allow_origin);
-
-    // Define VertextApiDoc conditionally only if the "google" feature is enabled
-    let doc = {
-        // avoid `mut` if possible
-        #[cfg(feature = "google")]
-        {
-            #[derive(OpenApi)]
-            #[openapi(
-                paths(vertex_compatibility),
-                components(schemas(VertexRequest, VertexResponse, VertexPrediction))
-            )]
-            struct VertextApiDoc;
-
-            // limiting mutability to the smallest scope necessary
-            let mut doc = ApiDoc::openapi();
-            doc.merge(VertextApiDoc::openapi());
-            doc
-        }
-        #[cfg(not(feature = "google"))]
-        ApiDoc::openapi()
-    };
 
     let mut routes = Router::new()
         // Base routes
@@ -1749,9 +1723,22 @@ pub async fn run(
         // Inference API health route
         .route("/", get(health))
         // AWS Sagemaker health route
-        .route("/ping", get(health))
-        // Prometheus metrics route
-        .route("/metrics", get(metrics));
+        .route("/ping", get(health));
+
+    let mut prom_handle = None;
+
+    if let Some(prom_builder) = prom_builder {
+        // See: https://github.com/metrics-rs/metrics/issues/467#issuecomment-2022755151
+        let (recorder, _) = prom_builder
+            .build()
+            .context("failed to build prometheus recorder")?;
+
+        prom_handle = Some(recorder.handle());
+        metrics::set_global_recorder(recorder).context("Failed to set global recorder")?;
+
+        public_routes = public_routes // Prometheus metrics route
+            .route("/metrics", get(metrics));
+    }
 
     #[cfg(feature = "google")]
     {
@@ -1825,13 +1812,11 @@ pub async fn run(
         routes = routes.layer(axum::middleware::from_fn(auth));
     }
 
-    let app = Router::new()
-        .merge(SwaggerUi::new("/docs").url("/api-doc/openapi.json", doc))
+    let mut app = Router::new()
         .merge(routes)
         .merge(public_routes)
         .layer(Extension(infer))
         .layer(Extension(info))
-        .layer(Extension(prom_handle.clone()))
         .layer(OtelAxumLayer::default())
         .layer(axum::middleware::from_fn(
             logging::http::trace_context_middleware,
@@ -1839,20 +1824,175 @@ pub async fn run(
         .layer(DefaultBodyLimit::max(payload_limit))
         .layer(cors_layer);
 
-    // Run server
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .context(format!("Could not bind TCP Listener on {addr}"))?;
+    if let Some(prom_handle) = prom_handle {
+        app = app.layer(Extension(prom_handle.clone()));
+    }
 
-    tracing::info!("Starting HTTP server: {}", &addr);
-    tracing::info!("Ready");
+    if include_swagger_routes {
+        let doc = get_openapi_doc(None);
 
-    axum::serve(listener, app)
-        // Wait until all requests are finished to shut down
-        .with_graceful_shutdown(shutdown::shutdown_signal())
-        .await?;
+        app = app.merge(
+            SwaggerUi::new(format!("{prefix}/docs"))
+                .url(format!("{prefix}/api-doc/openapi.json"), doc),
+        );
+    }
 
-    Ok(())
+    Ok(app)
+}
+
+/// This is used to generate the OpenAPI docs.
+/// The TER router will include these by default, but if you're
+/// including the TER into another project, you can generate the
+/// OpenAPI docs separately to merge with the other project OpenAPI docs.
+///
+/// ### Arguments
+/// * `base_path` - the base path of the TER instance (in case the TER is being included in another axum project)
+///
+/// ### Example
+/// ```no_run
+/// // MyApp
+/// use axum::{Router, routing::{get, post}};
+/// use utoipa::OpenApi;
+/// use utoipa_swagger_ui::SwaggerUi;
+/// use text-embeddings-router::router::http::get_openapi_doc;
+///
+/// #[derive(OpenApi)]
+/// #[openapi(
+///     paths(root, controllers::custom_chat),
+///     tags(
+///         (name = "hello", description = "Hello world endpoints")
+///     ),
+///     info(
+///         title = "Hello World API",
+///         version = "1.0.0",
+///         description = "A simple API that responds with a greeting"
+///     )
+/// )]
+/// struct ApiDoc;
+///
+/// let ter_base_path = "/api/ter";
+/// let ter_doc = get_openapi_doc(Some(ter_base_path));
+/// let mut api_docs = ApiDoc::openapi();
+/// api_docs.merge(ter_doc);
+///
+/// let app = Router::new()
+///   .route("/", get(root))
+///   .merge(SwaggerUi::new("/api-docs").url("/api-docs/openapi.json", api_docs));
+/// ```
+pub fn get_openapi_doc(base_path: Option<&str>) -> utoipa::openapi::OpenApi {
+    #[derive(OpenApi)]
+    #[openapi(
+        paths(
+            get_model_info,
+            health,
+            predict,
+            rerank,
+            embed,
+            embed_all,
+            embed_sparse,
+            openai_embed,
+            similarity,
+            tokenize,
+            decode,
+            metrics,
+        ),
+        components(
+            schemas(
+                PredictInput,
+                Input,
+                Info,
+                ModelType,
+                ClassifierModel,
+                Embedding,
+                EncodingFormat,
+                EmbeddingModel,
+                PredictRequest,
+                Prediction,
+                PredictResponse,
+                OpenAICompatRequest,
+                OpenAICompatEmbedding,
+                OpenAICompatUsage,
+                OpenAICompatResponse,
+                EmbedAllRequest,
+                EmbedAllResponse,
+                EmbedSparseRequest,
+                SparseValue,
+                EmbedSparseResponse,
+                RerankRequest,
+                Rank,
+                RerankResponse,
+                EmbedRequest,
+                EmbedResponse,
+                ErrorResponse,
+                OpenAICompatErrorResponse,
+                TokenizeInput,
+                TokenizeRequest,
+                TokenizeResponse,
+                TruncationDirection,
+                SimilarityInput,
+                SimilarityParameters,
+                SimilarityRequest,
+                SimilarityResponse,
+                SimpleToken,
+                InputType,
+                InputIds,
+                DecodeRequest,
+                DecodeResponse,
+                ErrorType,
+            )
+        ),
+        tags(
+            (name = "Text Embeddings Inference", description = "Hugging Face Text Embeddings Inference API")
+        ),
+        info(
+            title = "Text Embeddings Inference",
+            license(
+                name = "Apache 2.0",
+                url = "https://www.apache.org/licenses/LICENSE-2.0"
+            )
+        )
+    )]
+    struct ApiDoc;
+
+    // Define VertextApiDoc conditionally only if the "google" feature is enabled
+    let mut doc = {
+        // avoid `mut` if possible
+        #[cfg(feature = "google")]
+        {
+            #[derive(OpenApi)]
+            #[openapi(
+                paths(vertex_compatibility),
+                components(schemas(VertexRequest, VertexResponse, VertexPrediction))
+            )]
+            struct VertextApiDoc;
+
+            // limiting mutability to the smallest scope necessary
+            let mut doc = ApiDoc::openapi();
+            doc.merge(VertextApiDoc::openapi());
+            doc
+        }
+        #[cfg(not(feature = "google"))]
+        ApiDoc::openapi()
+    };
+
+    if let Some(prefix) = base_path {
+        if !prefix.is_empty() {
+            let mut prefixed_paths = utoipa::openapi::Paths::default();
+
+            let original_paths = std::mem::take(&mut doc.paths.paths);
+
+            for (path, item) in original_paths {
+                let prefixed_path = format!("{}{}", prefix, path);
+                prefixed_paths.paths.insert(prefixed_path, item);
+            }
+
+            prefixed_paths.extensions = doc.paths.extensions.clone();
+
+            doc.paths = prefixed_paths;
+        }
+    }
+
+    doc
 }
 
 impl From<&ErrorType> for StatusCode {
