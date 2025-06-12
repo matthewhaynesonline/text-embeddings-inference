@@ -1829,7 +1829,7 @@ pub fn init_router(
     }
 
     if include_swagger_routes {
-        let doc = get_openapi_doc(None);
+        let doc = get_openapi_doc(None, true);
 
         app = app.merge(
             SwaggerUi::new(format!("{prefix}/docs"))
@@ -1879,7 +1879,10 @@ pub fn init_router(
 ///   .route("/", get(root))
 ///   .merge(SwaggerUi::new("/api-docs").url("/api-docs/openapi.json", api_docs));
 /// ```
-pub fn get_openapi_doc(base_path: Option<&str>) -> utoipa::openapi::OpenApi {
+pub fn get_openapi_doc(
+    base_path: Option<&str>,
+    include_metrics_route: bool,
+) -> utoipa::openapi::OpenApi {
     #[derive(OpenApi)]
     #[openapi(
         paths(
@@ -1894,7 +1897,6 @@ pub fn get_openapi_doc(base_path: Option<&str>) -> utoipa::openapi::OpenApi {
             similarity,
             tokenize,
             decode,
-            metrics,
         ),
         components(
             schemas(
@@ -1954,6 +1956,10 @@ pub fn get_openapi_doc(base_path: Option<&str>) -> utoipa::openapi::OpenApi {
     )]
     struct ApiDoc;
 
+    #[derive(OpenApi)]
+    #[openapi(paths(metrics))]
+    struct MetricsApiDoc;
+
     // Define VertextApiDoc conditionally only if the "google" feature is enabled
     let mut doc = {
         // avoid `mut` if possible
@@ -1974,6 +1980,10 @@ pub fn get_openapi_doc(base_path: Option<&str>) -> utoipa::openapi::OpenApi {
         #[cfg(not(feature = "google"))]
         ApiDoc::openapi()
     };
+
+    if include_metrics_route {
+        doc.merge(MetricsApiDoc::openapi());
+    }
 
     if let Some(prefix) = base_path {
         if !prefix.is_empty() {

@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use opentelemetry::global;
 use text_embeddings_backend::DType;
+use text_embeddings_router::defaults;
 use veil::Redact;
 
 #[cfg(not(target_os = "linux"))]
@@ -17,7 +18,7 @@ struct Args {
     /// `BAAI/bge-large-en-v1.5`.
     /// Or it can be a local directory containing the necessary files
     /// as saved by `save_pretrained(...)` methods of transformers
-    #[clap(default_value = "BAAI/bge-large-en-v1.5", long, env)]
+    #[clap(default_value = defaults::MODEL_ID, long, env)]
     #[redact(partial)]
     model_id: String,
 
@@ -48,7 +49,7 @@ struct Args {
     /// The maximum amount of concurrent requests for this particular deployment.
     /// Having a low limit will refuse clients requests instead of having them
     /// wait for too long and is usually good to handle backpressure correctly.
-    #[clap(default_value = "512", long, env)]
+    #[clap(default_value = stringify!(defaults::MAX_CONCURRENT_REQUESTS), long, env)]
     max_concurrent_requests: usize,
 
     /// **IMPORTANT** This is one critical control to allow maximum usage
@@ -62,7 +63,7 @@ struct Args {
     /// Overall this number should be the largest possible until the model is compute bound.
     /// Since the actual memory overhead depends on the model implementation,
     /// text-embeddings-inference cannot infer this number automatically.
-    #[clap(default_value = "16384", long, env)]
+    #[clap(default_value = stringify!(defaults::MAX_BATCH_TOKENS), long, env)]
     max_batch_tokens: usize,
 
     /// Optionally control the maximum number of individual requests in a batch
@@ -70,7 +71,7 @@ struct Args {
     max_batch_requests: Option<usize>,
 
     /// Control the maximum number of inputs that a client can send in a single request
-    #[clap(default_value = "32", long, env)]
+    #[clap(default_value = stringify!(defaults::MAX_CLIENT_BATCH_SIZE), long, env)]
     max_client_batch_size: usize,
 
     /// Automatically truncate inputs that are longer than the maximum supported size
@@ -117,16 +118,16 @@ struct Args {
     hf_token: Option<String>,
 
     /// The IP address to listen on
-    #[clap(default_value = "0.0.0.0", long, env)]
+    #[clap(default_value = defaults::HOSTNAME, long, env)]
     hostname: String,
 
     /// The port to listen on.
-    #[clap(default_value = "3000", long, short, env)]
+    #[clap(default_value = stringify!(defaults::PORT), long, short, env)]
     port: u16,
 
     /// The name of the unix socket some text-embeddings-inference backends will use as they
     /// communicate internally with gRPC.
-    #[clap(default_value = "/tmp/text-embeddings-inference-server", long, env)]
+    #[clap(default_value = defaults::UDS_PATH, long, env)]
     uds_path: String,
 
     /// The location of the huggingface hub cache.
@@ -137,7 +138,7 @@ struct Args {
     /// Payload size limit in bytes
     ///
     /// Default is 2MB
-    #[clap(default_value = "2000000", long, env)]
+    #[clap(default_value = stringify!(defaults::PAYLOAD_LIMIT), long, env)]
     payload_limit: usize,
 
     /// Set an api key for request authorization.
@@ -161,11 +162,11 @@ struct Args {
 
     /// The service name for opentelemetry.
     /// e.g. `text-embeddings-inference.server`
-    #[clap(default_value = "text-embeddings-inference.server", long, env)]
+    #[clap(default_value = defaults::OTLP_SERVICE_NAME, long, env)]
     otlp_service_name: String,
 
     /// The Prometheus port to listen on.
-    #[clap(default_value = "9000", long, env)]
+    #[clap(default_value = stringify!(defaults::PROMETHEUS_PORT), long, env)]
     prometheus_port: u16,
 
     /// Unused for gRPC servers

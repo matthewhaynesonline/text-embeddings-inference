@@ -39,6 +39,19 @@ use tracing::Span;
 
 pub use logging::init_logging;
 
+pub mod defaults {
+    pub const MODEL_ID: &str = "BAAI/bge-large-en-v1.5";
+    pub const MAX_CONCURRENT_REQUESTS: usize = 512;
+    pub const MAX_BATCH_TOKENS: usize = 16384;
+    pub const MAX_CLIENT_BATCH_SIZE: usize = 32;
+    pub const HOSTNAME: &str = "0.0.0.0";
+    pub const PORT: u16 = 3000;
+    pub const UDS_PATH: &str = "/tmp/text-embeddings-inference-server";
+    pub const PAYLOAD_LIMIT: usize = 2000000;
+    pub const OTLP_SERVICE_NAME: &str = "text-embeddings-inference.server";
+    pub const PROMETHEUS_PORT: u16 = 9000;
+}
+
 /// Create entrypoint
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
